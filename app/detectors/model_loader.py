@@ -1,4 +1,5 @@
 # app/detectors/model_loader.py
+
 import os
 from functools import lru_cache
 
@@ -35,12 +36,23 @@ class DummyDeepfakeModel(nn.Module):
 
 
 def _load_model(device: torch.device) -> nn.Module:
+    """
+    Try to load a real model from VIDEO_MODEL_PATH.
+    If the file is missing or invalid, fall back to DummyDeepfakeModel.
+    """
     settings = get_settings()
     model_path = settings.VIDEO_MODEL_PATH
 
+    model: nn.Module
+
     if os.path.exists(model_path):
-        # When you have a real model file, this will load it.
-        model = torch.load(model_path, map_location=device)
+        try:
+            # When you have a real model file, this will load it.
+            model = torch.load(model_path, map_location=device)
+        except Exception as e:
+            # Placeholder / invalid .pt file → use dummy instead
+            print(f"[TrueSight] Failed to load model from {model_path}: {e}")
+            model = DummyDeepfakeModel()
     else:
         # For now, use the dummy model.
         model = DummyDeepfakeModel()
