@@ -1,4 +1,5 @@
 # app/detectors/video.py
+
 from typing import List, Literal, Tuple
 import base64
 import io
@@ -23,13 +24,22 @@ _transform = T.Compose([
 
 def _decode_base64_image(data_url: str) -> Image.Image:
     """
-    Expects data URLs like: 'data:image/jpeg;base64,/9j/4AAQ...'
-    or plain base64 string.
+    Handles both full data URLs and raw base64 strings.
+    Fixes whitespace + padding automatically.
     """
+    # Extract base64 if data URL
     if "," in data_url:
         _, b64data = data_url.split(",", 1)
     else:
         b64data = data_url
+
+    # Remove whitespace/newlines
+    b64data = "".join(b64data.split())
+
+    # Fix base64 padding if needed
+    missing_padding = len(b64data) % 4
+    if missing_padding:
+        b64data += "=" * (4 - missing_padding)
 
     img_bytes = base64.b64decode(b64data)
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -40,7 +50,7 @@ def _aggregate_scores(scores: List[float]) -> Tuple[Literal["REAL", "FAKE", "UNC
     """
     Convert per-frame fake probabilities into a global verdict.
 
-    Example policy:
+    Policy:
       - If any frame > 0.80 → FAKE
       - Else if all frames < 0.30 → REAL
       - Else → UNCLEAR
@@ -49,7 +59,6 @@ def _aggregate_scores(scores: List[float]) -> Tuple[Literal["REAL", "FAKE", "UNC
         return "UNCLEAR", 0
 
     max_fake = max(scores)
-    min_fake = min(scores)
 
     if max_fake > 0.80:
         verdict: Literal["REAL", "FAKE", "UNCLEAR"] = "FAKE"
@@ -60,8 +69,7 @@ def _aggregate_scores(scores: List[float]) -> Tuple[Literal["REAL", "FAKE", "UNC
         confidence = int((1.0 - max_fake) * 100)
     else:
         verdict = "UNCLEAR"
-        # mid-range → lower confidence
-        # simple heuristic in 40–70 range
+        # mid-range → lower confidence (roughly 40–70)
         confidence = int(40 + (max_fake - 0.3) / 0.5 * 30)
         confidence = max(0, min(confidence, 100))
 
@@ -86,7 +94,7 @@ def analyze_frames(
     model = get_video_model()
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
-    tensors = []
+    tensors: List[torch.Tensor] = []
     for data_url in frames_base64:
         try:
             img = _decode_base64_image(data_url)
@@ -96,6 +104,7 @@ def analyze_frames(
             continue
 
     if not tensors:
+        # If every frame failed to decode, bail out gracefully
         return [], "UNCLEAR", 0
 
     batch = torch.stack(tensors).to(device)  # [batch, 3, 224, 224]
