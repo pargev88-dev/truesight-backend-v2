@@ -107,9 +107,10 @@ def analyze_frames(
         # If every frame failed to decode, bail out gracefully
         return [], "UNCLEAR", 0
 
-    batch = torch.stack(tensors).to(device)  # [batch, 3, 224, 224]
+    batch = torch.stack(tensors).to(device, non_blocking=True)  # [batch, 3, 224, 224]
 
-    with torch.no_grad():
+    # Slightly faster than no_grad() for inference-only workloads
+    with torch.inference_mode():
         outputs = model(batch)          # expect shape [batch, 1]
         probs_fake = outputs.view(-1).detach().cpu().numpy().tolist()
 
