@@ -7,5 +7,5 @@ numpy
 python-dotenv
 pydantic-settings
 timm==0.9.16
-retinaface
+mtcnn
 opencv-python-headless
