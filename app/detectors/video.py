@@ -15,16 +15,8 @@ from app.detectors.model_loader import get_video_model
 # QUALITY FILTERS
 # -----------------------------
 def _is_low_quality(img: Image.Image) -> bool:
-    """
-    Returns True if the frame is too blurry / low-detail.
-    Uses variance of Laplacian approximation.
-    """
-    gray = img.convert("L")
-    lap = gray.filter(ImageFilter.FIND_EDGES)
-    variance = torch.tensor(lap).float().var().item()
+    return False
 
-    # Very low detail → skip this frame
-    return variance < 5.0  # tuned threshold
 
 
 # -----------------------------
@@ -60,40 +52,21 @@ def _decode_base64_image(data_url: str) -> Image.Image:
 # -----------------------------
 def _aggregate_scores(scores: List[float]) -> Tuple[Literal["REAL", "FAKE", "UNCLEAR"], int]:
     """
-    Improved logic:
-      - FAKE requires:
-            max_fake >= 0.93 AND at least 2 frames >= 0.90
-      - REAL requires:
-            all frames <= 0.20
-      - Otherwise UNCLEAR
+    Pass-through mode:
+    - We do NOT label as REAL or FAKE.
+    - We just return the max fake probability as the "confidence".
+    - verdict is always 'UNCLEAR' so the UI shows e.g.:
+        'Unclear (67% confidence)'
+      where 67% is the model's estimated fake probability.
     """
     if not scores:
         return "UNCLEAR", 0
 
-    max_fake = max(scores)
-    strong_fakes = [s for s in scores if s >= 0.90]
+    max_fake = max(scores)          # in [0, 1]
+    confidence = int(round(max_fake * 100))  # 0–100
 
-    # --- FAKE RULE (more conservative)
-    if max_fake >= 0.93 and len(strong_fakes) >= 2:
-        verdict: Literal["REAL", "FAKE", "UNCLEAR"] = "FAKE"
-        confidence = int(max_fake * 100)
-        return verdict, confidence
-
-    # --- REAL RULE
-    if all(s <= 0.20 for s in scores):
-        verdict = "REAL"
-        confidence = int((1.0 - max_fake) * 100)  # strong real → high confidence
-        return verdict, confidence
-
-    # --- UNCLEAR RULE
-    # Build a balanced confidence score.
-    # If max_fake ~0.50 → ~50% confidence
-    # If max_fake ~0.80 → ~70% confidence
-    # If max_fake ~0.30 → ~40% confidence
-    confidence = int(40 + (max_fake - 0.20) / 0.73 * 40)
-    confidence = max(0, min(confidence, 100))
+    # Always return UNCLEAR; UI just displays the % number.
     return "UNCLEAR", confidence
-
 
 # -----------------------------
 # MAIN ANALYSIS FUNCTION
