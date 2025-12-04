@@ -69,11 +69,16 @@ def _try_load_state_dict(model: nn.Module, model_path: str, device: torch.device
     ckpt = torch.load(model_path, map_location=device)
 
     if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        # Common pattern: {"state_dict": ...}
         state_dict = ckpt["state_dict"]
+        print("[TrueSight] ℹ️ Found 'state_dict' key in checkpoint.")
     elif isinstance(ckpt, dict):
+        # Raw state_dict
         state_dict = ckpt
+        print("[TrueSight] ℹ️ Checkpoint looks like a raw state_dict.")
     else:
         # File was saved as a full model; just return that
+        print(f"[TrueSight] ℹ️ Checkpoint is a full model object: {type(ckpt)}")
         return ckpt.to(device)
 
     model.load_state_dict(state_dict)
@@ -88,20 +93,24 @@ def _load_model(device: torch.device) -> nn.Module:
     settings = get_settings()
     model_path = settings.VIDEO_MODEL_PATH
 
+    print(f"[TrueSight] 🔍 VIDEO_MODEL_PATH = {model_path}")
+
     # Default: ResNet-based detector (untrained until you add weights)
     model: nn.Module = VideoDeepfakeNet()
 
     if os.path.exists(model_path):
         try:
+            print(f"[TrueSight] 🧪 Attempting to load model/weights from {model_path}")
             model = _try_load_state_dict(model, model_path, device)
-            print(f"[TrueSight] Loaded video model from {model_path}")
+            print(f"[TrueSight] ✅ Loaded video model of type {type(model)} from {model_path}")
         except Exception as e:
             # Placeholder / invalid .pt file → use dummy instead of crashing
-            print(f"[TrueSight] Failed to load model from {model_path}: {e}")
+            print(f"[TrueSight] ❌ Failed to load model from {model_path}: {e}")
             model = DummyDeepfakeModel()
+            print("[TrueSight] ⚠️ Falling back to DummyDeepfakeModel().")
     else:
         # No file yet → dummy
-        print(f"[TrueSight] No model file at {model_path}; using DummyDeepfakeModel().")
+        print(f"[TrueSight] ❌ Model file not found at {model_path}; using DummyDeepfakeModel().")
         model = DummyDeepfakeModel()
 
     model.to(device)
