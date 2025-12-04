@@ -4,89 +4,108 @@ from typing import List, Literal, Tuple
 import base64
 import io
 
-from PIL import Image
+from PIL import Image, ImageFilter
 import torch
 import torchvision.transforms as T
 
 from app.detectors.model_loader import get_video_model
 
 
-# Image preprocessing (adjust sizes/means if you swap models later)
+# -----------------------------
+# QUALITY FILTERS
+# -----------------------------
+def _is_low_quality(img: Image.Image) -> bool:
+    """
+    Returns True if the frame is too blurry / low-detail.
+    Uses variance of Laplacian approximation.
+    """
+    gray = img.convert("L")
+    lap = gray.filter(ImageFilter.FIND_EDGES)
+    variance = torch.tensor(lap).float().var().item()
+
+    # Very low detail → skip this frame
+    return variance < 5.0  # tuned threshold
+
+
+# -----------------------------
+# IMAGE PREPROCESSING
+# -----------------------------
 _transform = T.Compose([
-    T.Resize((224, 224)),      # common input size; change if your model needs different
-    T.ToTensor(),              # [0, 1]
+    T.Resize((224, 224)),
+    T.ToTensor(),
     T.Normalize(
-        mean=[0.485, 0.456, 0.406],  # ImageNet stats
+        mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     ),
 ])
 
 
 def _decode_base64_image(data_url: str) -> Image.Image:
-    """
-    Handles both full data URLs and raw base64 strings.
-    Fixes whitespace + padding automatically.
-    """
-    # Extract base64 if data URL
     if "," in data_url:
         _, b64data = data_url.split(",", 1)
     else:
         b64data = data_url
 
-    # Remove whitespace/newlines
     b64data = "".join(b64data.split())
-
-    # Fix base64 padding if needed
     missing_padding = len(b64data) % 4
     if missing_padding:
         b64data += "=" * (4 - missing_padding)
 
     img_bytes = base64.b64decode(b64data)
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    return img
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
 
+# -----------------------------
+# SMART AGGREGATION (UPGRADED)
+# -----------------------------
 def _aggregate_scores(scores: List[float]) -> Tuple[Literal["REAL", "FAKE", "UNCLEAR"], int]:
     """
-    Convert per-frame fake probabilities into a global verdict.
-
-    Policy:
-      - If any frame > 0.80 → FAKE
-      - Else if all frames < 0.30 → REAL
-      - Else → UNCLEAR
+    Improved logic:
+      - FAKE requires:
+            max_fake >= 0.93 AND at least 2 frames >= 0.90
+      - REAL requires:
+            all frames <= 0.20
+      - Otherwise UNCLEAR
     """
     if not scores:
         return "UNCLEAR", 0
 
     max_fake = max(scores)
+    strong_fakes = [s for s in scores if s >= 0.90]
 
-    if max_fake > 0.80:
+    # --- FAKE RULE (more conservative)
+    if max_fake >= 0.93 and len(strong_fakes) >= 2:
         verdict: Literal["REAL", "FAKE", "UNCLEAR"] = "FAKE"
         confidence = int(max_fake * 100)
-    elif max_fake < 0.30:
+        return verdict, confidence
+
+    # --- REAL RULE
+    if all(s <= 0.20 for s in scores):
         verdict = "REAL"
-        # strongest frame still looks real; confidence based on “not fake”
-        confidence = int((1.0 - max_fake) * 100)
-    else:
-        verdict = "UNCLEAR"
-        # mid-range → lower confidence (roughly 40–70)
-        confidence = int(40 + (max_fake - 0.3) / 0.5 * 30)
-        confidence = max(0, min(confidence, 100))
+        confidence = int((1.0 - max_fake) * 100)  # strong real → high confidence
+        return verdict, confidence
 
-    return verdict, confidence
+    # --- UNCLEAR RULE
+    # Build a balanced confidence score.
+    # If max_fake ~0.50 → ~50% confidence
+    # If max_fake ~0.80 → ~70% confidence
+    # If max_fake ~0.30 → ~40% confidence
+    confidence = int(40 + (max_fake - 0.20) / 0.73 * 40)
+    confidence = max(0, min(confidence, 100))
+    return "UNCLEAR", confidence
 
 
-def analyze_frames(
-    frames_base64: List[str],
-) -> Tuple[List[float], Literal["REAL", "FAKE", "UNCLEAR"], int]:
+# -----------------------------
+# MAIN ANALYSIS FUNCTION
+# -----------------------------
+def analyze_frames(frames_base64: List[str]) -> Tuple[List[float], Literal["REAL", "FAKE", "UNCLEAR"], int]:
     """
-    Main entry point used by the /api/v1/scan endpoint.
-
     Steps:
-      1. Decode base64 frames to PIL images.
-      2. Preprocess to tensors.
-      3. Run through the PyTorch model.
-      4. Aggregate per-frame fake probabilities into verdict + confidence.
+      1. Decode frames
+      2. Filter low-quality frames
+      3. Preprocess
+      4. Model inference
+      5. Smart aggregation
     """
     if not frames_base64:
         return [], "UNCLEAR", 0
@@ -95,26 +114,30 @@ def analyze_frames(
     device = getattr(model, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     tensors: List[torch.Tensor] = []
+
     for data_url in frames_base64:
         try:
             img = _decode_base64_image(data_url)
+
+            # -----------------------------
+            # APPLY QUALITY FILTER
+            # -----------------------------
+            if _is_low_quality(img):
+                continue  # skip blurry/low-detail frames
+
             tensors.append(_transform(img))
         except Exception:
-            # If decoding fails for a frame, skip it
-            continue
+            continue  # skip bad frames
 
     if not tensors:
-        # If every frame failed to decode, bail out gracefully
         return [], "UNCLEAR", 0
 
-    batch = torch.stack(tensors).to(device, non_blocking=True)  # [batch, 3, 224, 224]
+    batch = torch.stack(tensors).to(device, non_blocking=True)
 
-    # Slightly faster than no_grad() for inference-only workloads
     with torch.inference_mode():
-        outputs = model(batch)          # expect shape [batch, 1]
+        outputs = model(batch)          # shape [batch, 1]
         probs_fake = outputs.view(-1).detach().cpu().numpy().tolist()
 
-    # Ensure python floats
     frame_scores = [float(p) for p in probs_fake]
 
     verdict, confidence = _aggregate_scores(frame_scores)
