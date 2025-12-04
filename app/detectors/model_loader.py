@@ -53,7 +53,7 @@ class EfficientNetDeepfake(nn.Module):
         """
         logits = self.backbone(x)  # [B, 2]
         probs = torch.softmax(logits, dim=1)  # [B, 2]
-        fake_prob = probs[:, 1].unsqueeze(1)  # [B, 1]
+        fake_prob = probs[:, 0].unsqueeze(1)  # [B, 1]
         return fake_prob
 
 
