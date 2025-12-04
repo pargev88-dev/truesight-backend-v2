@@ -5,38 +5,56 @@ from functools import lru_cache
 
 import torch
 import torch.nn as nn
-from torchvision import models
 
 from app.core.config import get_settings
 
+# NEW: we use timm's EfficientNet implementation
+try:
+    import timm
+except ImportError:
+    timm = None
+    print("[TrueSight] ❌ 'timm' is not installed. "
+          "Add `timm` to requirements.txt and redeploy.")
 
-class VideoDeepfakeNet(nn.Module):
+
+class EfficientNetDeepfake(nn.Module):
     """
-    ResNet18 backbone + binary head for deepfake detection.
+    EfficientNet-B0 backbone (from timm) for binary deepfake detection.
 
-    Later you can train this model (or a compatible one) and save weights to
-    models/video/deepfake_model.pt using:
+    - Expects RGB images normalized like ImageNet, size ~224x224.
+    - Outputs a single-column tensor [B, 1] with fake probability in [0, 1].
 
-        torch.save(model.state_dict(), "models/video/deepfake_model.pt")
-
-    This loader will then pick them up automatically.
+    Your checkpoint deepfake_model.pt is an EfficientNet-like state_dict with:
+        - features.* modules
+        - classifier.1.weight of shape [2, 1280]
+    so we construct an EfficientNet-B0 with num_classes=2 and
+    then take softmax(class 1) as the FAKE probability.
     """
+
     def __init__(self):
         super().__init__()
-        # Use ResNet18 backbone (no auto-download of ImageNet weights)
-        backbone = models.resnet18(weights=None)
-        num_features = backbone.fc.in_features
-        backbone.fc = nn.Identity()       # remove original classifier
+        if timm is None:
+            raise RuntimeError(
+                "timm is required for EfficientNetDeepfake. "
+                "Add `timm` to requirements.txt."
+            )
 
-        self.backbone = backbone
-        self.head = nn.Linear(num_features, 1)
-        self.sigmoid = nn.Sigmoid()
+        # Create EfficientNet-B0 with 2 output classes (e.g. [real, fake])
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=False,
+            num_classes=2,
+            in_chans=3,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone(x)          # [B, num_features]
-        logits = self.head(feats)         # [B, 1]
-        probs = self.sigmoid(logits)      # [B, 1] in [0, 1]
-        return probs
+        """
+        x: [B, 3, H, W] → logits [B, 2] → probs [B, 1] (fake)
+        """
+        logits = self.backbone(x)  # [B, 2]
+        probs = torch.softmax(logits, dim=1)  # [B, 2]
+        fake_prob = probs[:, 1].unsqueeze(1)  # [B, 1]
+        return fake_prob
 
 
 class DummyDeepfakeModel(nn.Module):
@@ -61,56 +79,56 @@ class DummyDeepfakeModel(nn.Module):
         return x                  # fake probability in [0, 1]
 
 
-def _try_load_state_dict(model: nn.Module, model_path: str, device: torch.device) -> nn.Module:
-    """
-    Try to load a state_dict from model_path into the given model.
-    If anything fails, the caller will decide how to fall back.
-    """
-    ckpt = torch.load(model_path, map_location=device)
-
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        # Common pattern: {"state_dict": ...}
-        state_dict = ckpt["state_dict"]
-        print("[TrueSight] ℹ️ Found 'state_dict' key in checkpoint.")
-    elif isinstance(ckpt, dict):
-        # Raw state_dict
-        state_dict = ckpt
-        print("[TrueSight] ℹ️ Checkpoint looks like a raw state_dict.")
-    else:
-        # File was saved as a full model; just return that
-        print(f"[TrueSight] ℹ️ Checkpoint is a full model object: {type(ckpt)}")
-        return ckpt.to(device)
-
-    model.load_state_dict(state_dict)
-    return model
-
-
 def _load_model(device: torch.device) -> nn.Module:
     """
-    Try to load a real model from VIDEO_MODEL_PATH.
-    If the file is missing or invalid, fall back to a small dummy model.
+    Try to load EfficientNet weights from VIDEO_MODEL_PATH.
+    If anything fails, fall back to DummyDeepfakeModel.
     """
     settings = get_settings()
     model_path = settings.VIDEO_MODEL_PATH
 
     print(f"[TrueSight] 🔍 VIDEO_MODEL_PATH = {model_path}")
 
-    # Default: ResNet-based detector (untrained until you add weights)
-    model: nn.Module = VideoDeepfakeNet()
+    # Start with EfficientNet-based detector
+    try:
+        model: nn.Module = EfficientNetDeepfake()
+    except Exception as e:
+        print(f"[TrueSight] ❌ Could not initialize EfficientNetDeepfake: {e}")
+        print("[TrueSight] ⚠️ Falling back to DummyDeepfakeModel().")
+        model = DummyDeepfakeModel()
+        model.to(device)
+        model.eval()
+        return model
 
     if os.path.exists(model_path):
         try:
-            print(f"[TrueSight] 🧪 Attempting to load model/weights from {model_path}")
-            model = _try_load_state_dict(model, model_path, device)
-            print(f"[TrueSight] ✅ Loaded video model of type {type(model)} from {model_path}")
+            print(f"[TrueSight] 🧪 Attempting to load EfficientNet state_dict "
+                  f"from {model_path}")
+            ckpt = torch.load(model_path, map_location=device)
+
+            if not isinstance(ckpt, dict):
+                # If someone saved a full model object by mistake…
+                print(f"[TrueSight] ℹ️ Checkpoint is a full model object: "
+                      f"{type(ckpt)}; using it directly.")
+                model = ckpt.to(device)
+            else:
+                # Load with strict=False to allow for minor metadata diffs
+                missing, unexpected = model.backbone.load_state_dict(
+                    ckpt, strict=False
+                )
+                if missing:
+                    print(f"[TrueSight] ⚠️ Missing keys when loading: {missing}")
+                if unexpected:
+                    print(f"[TrueSight] ⚠️ Unexpected keys when loading: {unexpected}")
+
+                print("[TrueSight] ✅ Loaded EfficientNet-based deepfake model.")
         except Exception as e:
-            # Placeholder / invalid .pt file → use dummy instead of crashing
-            print(f"[TrueSight] ❌ Failed to load model from {model_path}: {e}")
-            model = DummyDeepfakeModel()
+            print(f"[TrueSight] ❌ Failed to load state_dict from {model_path}: {e}")
             print("[TrueSight] ⚠️ Falling back to DummyDeepfakeModel().")
+            model = DummyDeepfakeModel()
     else:
-        # No file yet → dummy
-        print(f"[TrueSight] ❌ Model file not found at {model_path}; using DummyDeepfakeModel().")
+        print(f"[TrueSight] ❌ Model file not found at {model_path}; "
+              "using DummyDeepfakeModel().")
         model = DummyDeepfakeModel()
 
     model.to(device)
