@@ -5,54 +5,44 @@ from functools import lru_cache
 
 import torch
 import torch.nn as nn
+from torchvision.models import efficientnet_b0
 
 from app.core.config import get_settings
-
-# NEW: we use timm's EfficientNet implementation
-try:
-    import timm
-except ImportError:
-    timm = None
-    print("[TrueSight] ❌ 'timm' is not installed. "
-          "Add `timm` to requirements.txt and redeploy.")
 
 
 class EfficientNetDeepfake(nn.Module):
     """
-    EfficientNet-B0 backbone (from timm) for binary deepfake detection.
+    EfficientNet-B0 backbone (from torchvision) for binary deepfake detection.
 
     - Expects RGB images normalized like ImageNet, size ~224x224.
     - Outputs a single-column tensor [B, 1] with fake probability in [0, 1].
 
-    Your checkpoint deepfake_model.pt is an EfficientNet-like state_dict with:
-        - features.* modules
-        - classifier.1.weight of shape [2, 1280]
-    so we construct an EfficientNet-B0 with num_classes=2 and
-    then take softmax(class 1) as the FAKE probability.
+    Your checkpoint deepfake_model.pt was trained on torchvision's
+    efficientnet_b0, which uses keys like:
+        - features.*
+        - classifier.1.weight (shape [2, 1280])
     """
 
     def __init__(self):
         super().__init__()
-        if timm is None:
-            raise RuntimeError(
-                "timm is required for EfficientNetDeepfake. "
-                "Add `timm` to requirements.txt."
-            )
 
-        # Create EfficientNet-B0 with 2 output classes (e.g. [real, fake])
-        self.backbone = timm.create_model(
-            "efficientnet_b0",
-            pretrained=False,
-            num_classes=2,
-            in_chans=3,
-        )
+        # Create EfficientNet-B0 with default architecture
+        backbone = efficientnet_b0(weights=None)  # no ImageNet weights
+
+        # Replace classifier to have 2 outputs (e.g., [FAKE, REAL])
+        in_features = backbone.classifier[1].in_features
+        backbone.classifier[1] = nn.Linear(in_features, 2)
+
+        self.backbone = backbone
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, 3, H, W] → logits [B, 2] → probs [B, 1] (fake)
         """
-        logits = self.backbone(x)  # [B, 2]
-        probs = torch.softmax(logits, dim=1)  # [B, 2]
+        logits = self.backbone(x)         # [B, 2]
+        probs = torch.softmax(logits, 1)  # [B, 2]
+
+        # The DeepfakeDetector repo uses class 0 = FAKE, class 1 = REAL
         fake_prob = probs[:, 0].unsqueeze(1)  # [B, 1]
         return fake_prob
 
@@ -106,22 +96,36 @@ def _load_model(device: torch.device) -> nn.Module:
                   f"from {model_path}")
             ckpt = torch.load(model_path, map_location=device)
 
-            if not isinstance(ckpt, dict):
-                # If someone saved a full model object by mistake…
-                print(f"[TrueSight] ℹ️ Checkpoint is a full model object: "
-                      f"{type(ckpt)}; using it directly.")
-                model = ckpt.to(device)
-            else:
-                # Load with strict=False to allow for minor metadata diffs
-                missing, unexpected = model.backbone.load_state_dict(
-                    ckpt, strict=False
-                )
-                if missing:
-                    print(f"[TrueSight] ⚠️ Missing keys when loading: {missing}")
-                if unexpected:
-                    print(f"[TrueSight] ⚠️ Unexpected keys when loading: {unexpected}")
+            # Handle Lightning-style checkpoints with a "state_dict" key
+            if isinstance(ckpt, dict) and "state_dict" in ckpt:
+                ckpt = ckpt["state_dict"]
 
-                print("[TrueSight] ✅ Loaded EfficientNet-based deepfake model.")
+            # Sometimes keys are prefixed like "model." or "net."
+            # Strip any leading prefix before "features" or "classifier".
+            cleaned_ckpt = {}
+            for k, v in ckpt.items():
+                if k.startswith("features.") or k.startswith("classifier."):
+                    cleaned_ckpt[k] = v
+                elif ".features." in k or ".classifier." in k:
+                    # e.g., "model.features.0.0.weight" -> "features.0.0.weight"
+                    idx = k.find("features.")
+                    if idx == -1:
+                        idx = k.find("classifier.")
+                    new_k = k[idx:]
+                    cleaned_ckpt[new_k] = v
+                else:
+                    # Ignore other keys (optimizer, schedulers, etc.)
+                    continue
+
+            missing, unexpected = model.backbone.load_state_dict(
+                cleaned_ckpt, strict=False
+            )
+            if missing:
+                print(f"[TrueSight] ⚠️ Missing keys when loading: {missing}")
+            if unexpected:
+                print(f"[TrueSight] ⚠️ Unexpected keys when loading: {unexpected}")
+
+            print("[TrueSight] ✅ Loaded torchvision EfficientNet-B0 deepfake model.")
         except Exception as e:
             print(f"[TrueSight] ❌ Failed to load state_dict from {model_path}: {e}")
             print("[TrueSight] ⚠️ Falling back to DummyDeepfakeModel().")
